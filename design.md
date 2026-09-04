@@ -38,6 +38,23 @@ operations concurrently.
 - **Panel driver**: translates logical frames into physical LED order.
 - **Command**: a transport-independent request to change application state.
 
+## Current implementation
+
+The single-panel desk firmware currently implements:
+
+- the `Rgbw`, `FrameBuffer`, `Effect`, `FrameSink`, `EffectManager`,
+  `PanelMapping`, and `PanelDriver` foundations;
+- deterministic, timestamp-driven `ExpandingRings` and `DigitalRain` effects;
+- effect assignment and restart with manager-owned 64-bit microsecond timing;
+- progressive, rotated, mirrored, and serpentine coordinate transforms;
+- a debounced active-low `BOOT` button on GPIO0 that toggles the demo effect;
+- host tests for timing independence, effect boundaries, manager assignment,
+  button debouncing, RGB channel limits, and panel mapping; and
+- one RGBW panel on GPIO16, starting in Digital Rain after reset.
+
+The physical button is also the ESP32 boot-mode strap. It must not be held while
+resetting or applying power during normal operation.
+
 ## Core value types
 
 The core types should be small value objects without dynamic allocation.
@@ -78,8 +95,8 @@ frame buffer.
 
 ```cpp
 struct EffectContext {
-    uint32_t elapsedMs;
-    uint32_t deltaMs;
+    uint64_t elapsedUs;
+    uint64_t deltaUs;
 
     // Added when the hardware is integrated:
     // Orientation orientation;
@@ -91,19 +108,14 @@ public:
     virtual ~Effect() = default;
 
     virtual const char* name() const = 0;
-    virtual void start(PanelIndex panel) = 0;
-    virtual void stop(PanelIndex panel) = 0;
+    virtual bool start(PanelIndex panel) = 0;
 
-    virtual void render(
+    virtual bool render(
         PanelIndex panel,
         const EffectContext& context,
         FrameBuffer& output
     ) = 0;
 
-    virtual bool setParameter(
-        uint16_t parameterId,
-        float value
-    ) = 0;
 };
 ```
 
@@ -127,28 +139,22 @@ project it differently for the front, back, left, right, top, and bottom.
 
 ## Effect state
 
-An effect may keep independent state for each panel:
+Deterministic effects should be pure renderers where practical:
 
 ```cpp
 class ExpandingRings final : public Effect {
 public:
-    void render(
+    bool render(
         PanelIndex panel,
         const EffectContext& context,
         FrameBuffer& output
     ) override;
-
-private:
-    struct State {
-        uint8_t activeRing = 0;
-        bool movingOutward = true;
-        uint32_t phaseStartedMs = 0;
-    };
-
-    std::array<State, 6> states_{};
-    Parameters parameters_{};
 };
 ```
+
+For these effects, the same panel, parameters, inputs and elapsed time always
+produce the same frame. Simulations such as cellular automata may keep bounded
+per-panel state and advance it with fixed timesteps derived from `deltaUs`.
 
 Alternatively, an effect may intentionally share state across panels:
 
@@ -170,29 +176,29 @@ when that assignment started.
 ```cpp
 struct PanelAssignment {
     Effect* effect = nullptr;
-    uint32_t startedAtMs = 0;
+    uint64_t assignedUs = 0;
+    uint64_t lastRenderedUs = 0;
 };
 
 class EffectManager {
 public:
-    void assign(PanelIndex panel, Effect* effect);
-    void clear(PanelIndex panel);
-    void setParameter(PanelIndex panel, uint16_t parameterId, float value);
-    void render(uint32_t nowMs);
+    bool assign(PanelIndex panel, Effect* effect, uint64_t nowUs);
+    bool clear(PanelIndex panel);
+    bool render(uint64_t nowUs);
 
 private:
     static constexpr size_t panelCount = 6;
 
     std::array<PanelAssignment, panelCount> assignments_{};
     std::array<FrameBuffer, panelCount> frames_{};
-    PanelDriver& panelDriver_;
+    FrameSink& sink_;
 };
 ```
 
 A typical render pass is:
 
 ```cpp
-void EffectManager::render(uint32_t nowMs)
+bool EffectManager::render(uint64_t nowUs)
 {
     for (PanelIndex panel = 0; panel < assignments_.size(); ++panel) {
         auto& assignment = assignments_[panel];
@@ -203,14 +209,15 @@ void EffectManager::render(uint32_t nowMs)
         }
 
         EffectContext context{
-            .elapsedMs = nowMs - assignment.startedAtMs,
-            .deltaMs = frameIntervalMs,
+            .elapsedUs = nowUs - assignment.assignedUs,
+            .deltaUs = nowUs - assignment.lastRenderedUs,
         };
 
         assignment.effect->render(panel, context, frames_[panel]);
     }
 
-    panelDriver_.show(frames_);
+    // Each completed frame is sent through FrameSink; PanelDriver is the
+    // production hardware implementation.
 }
 ```
 
@@ -242,12 +249,16 @@ wiring. Its responsibilities are:
 - transmit complete frames to the panels.
 
 ```cpp
-class PanelDriver {
+class PanelDriver : public FrameSink {
 public:
-    void show(std::span<const FrameBuffer> frames);
-    void setGlobalBrightness(uint8_t value);
+    esp_err_t initialize(int gpio, uint16_t panelCount = 1);
+    bool show(PanelIndex panel, const FrameBuffer& frame) override;
 };
 ```
+
+The current driver uses progressive rows. `PanelMapping` already provides
+rotation, mirroring, and serpentine transforms; per-face mapping configuration
+will be added when the six-panel wiring is known.
 
 Power limiting must remain downstream from effects. Effects describe desired
 colors; the driver or a dedicated `PowerLimiter` produces a safe output. This
@@ -265,10 +276,13 @@ for example 30 or 60 frames per second. It performs this sequence:
 5. Transmit frames.
 6. Wait until the next scheduled frame boundary.
 
-Effects implement animation as state machines based on elapsed time. The current
-expanding-ring effect must therefore be migrated away from its infinite loop and
-FreeRTOS delays. Each render call computes the current ring, direction, dwell,
-and crossfade from time and returns immediately.
+Deterministic timeline effects select their animation state directly from
+64-bit effect-local elapsed microseconds. The expanding-ring effect uses a
+compile-time phase table and maps a timestamp to its ring, direction, dwell and
+crossfade without advancing on each call. Thus skipped, duplicated or jittered
+render calls do not change the frame associated with a timestamp. Stateful
+simulations may instead consume `deltaUs` in fixed steps, with a bounded amount
+of catch-up work per render.
 
 ## Parameters
 
@@ -430,64 +444,47 @@ should cover:
 Hardware tests should separately verify LED component order, panel mapping,
 maximum current, sensor communication, wireless operation, and OTA/rollback.
 
-## Proposed source layout
+## Source layout
 
 ```text
 main/
   app_main.cpp
-
-  core/
-    color.h
-    framebuffer.h
-    effect.h
-    effect_manager.cpp
-    effect_manager.h
-    command.h
-    command_queue.h
-
-  hardware/
-    panel_driver.cpp
-    panel_driver.h
-    orientation_sensor.cpp
-    orientation_sensor.h
-
-  effects/
-    expanding_rings.cpp
-    expanding_rings.h
-    digital_rain.cpp
-    digital_rain.h
-
-  services/
-    bluetooth_service.cpp
-    bluetooth_service.h
-    wifi_service.cpp
-    wifi_service.h
-    ota_service.cpp
-    ota_service.h
-
+  color.hpp
+  debounced_button.hpp
+  digital_rain.cpp
+  digital_rain.hpp
+  effect.hpp
+  effect_manager.cpp
+  effect_manager.hpp
+  expanding_rings.cpp
+  expanding_rings.hpp
+  frame_buffer.hpp
+  frame_sink.hpp
+  panel_driver.cpp
+  panel_driver.hpp
+  panel_mapping.hpp
 tests/
-  test_framebuffer.cpp
-  test_effect_manager.cpp
-  test_expanding_rings.cpp
-  test_panel_mapping.cpp
-  test_power_limiter.cpp
+  test_effects.cpp
 ```
+
+As the project grows, these files can move into `core/`, `effects/`, and
+`hardware/` directories without changing the interfaces.
 
 ## Migration plan
 
-1. Rename the entry point to `app_main.cpp` and verify the existing firmware
-   builds under C++ without behavioral changes.
-2. Introduce `Rgbw` and `FrameBuffer` with host tests.
-3. Wrap the LED-strip handle in `PanelDriver` and move wiring translation and
-   power limits into it.
-4. Define `Effect`, `EffectContext`, and `EffectManager`.
-5. Convert expanding rings into a nonblocking `Effect` state machine and compare
-   its output and timing against the current implementation.
-6. Add a bounded command queue and serial command adapter for early testing.
-7. Add the orientation service and synthetic-orientation tests.
-8. Expand the driver and manager from one panel to six.
-9. Add BLE and/or Wi-Fi adapters without changing the core command API.
-10. Add signed OTA updates, boot validation, and rollback.
+1. **Complete:** migrate the entry point and effect framework to C++.
+2. **Complete:** introduce `Rgbw`, `FrameBuffer`, and host tests.
+3. **Partial:** wrap the LED-strip handle and implement wiring transforms;
+   centralized power limiting remains to be added.
+4. **Complete:** define `Effect`, `EffectContext`, `FrameSink`, and
+   `EffectManager`.
+5. **Complete:** convert expanding rings to deterministic nonblocking timing.
+6. **Complete:** add Digital Rain and local debounced effect selection.
+7. Add a bounded command queue and serial command adapter for early testing.
+8. Add the orientation service and synthetic-orientation tests.
+9. Expand the driver and manager from one panel to six.
+10. Add BLE and/or Wi-Fi adapters without changing the core command API.
+11. Add signed OTA updates, boot validation, and rollback.
 
 This ordering preserves a working visual demonstration during the refactor and
 keeps hardware, animation, control, and update concerns independently testable.
