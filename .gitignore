@@ -1,0 +1,11 @@
+# ESP-IDF generated output
+/build/
+/sdkconfig.old
+
+# Local caches and host-test binaries
+/.cache/
+
+# Editor and OS noise
+*.swp
+*~
+.DS_Store
